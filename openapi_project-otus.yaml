@@ -1,0 +1,1141 @@
+openapi: 3.0.0
+info:
+  title: API системы автоматизации заказов (ресторан быстрого питания с роботами)
+  description: |
+    API для управления заказами, меню, технологическими картами, продуктами,
+    остатками в роботах, заданиями на дозагрузку, аналитикой и интеграцией
+    с платёжной системой, табло и экраном кухни.
+  version: 1.0.0
+  contact:
+    name: Support Team
+    email: support@restaurant-system.com
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.restaurant-system.com/v1
+    description: Production server
+  - url: https://staging-api.restaurant-system.com/v1
+    description: Staging server
+
+tags:
+  - name: Заказы
+    description: Управление заказами (создание, отмена, получение статуса)
+  - name: Меню
+    description: Управление меню (CRUD, временное исключение позиций)
+  - name: Технологические карты
+    description: Управление технологическими картами для роботов
+  - name: Продукты
+    description: Управление справочником продуктов (ингредиентов)
+  - name: Остатки
+    description: Просмотр остатков продуктов в роботах
+  - name: Дозагрузка
+    description: Управление заданиями на дозагрузку продуктов
+  - name: Аналитика
+    description: Отчёты по техническим потерям и аналитика
+  - name: Логи
+    description: Просмотр логов и сбоев интеграции (через агрегацию)
+  - name: Аутентификация
+    description: Управление пользователями и аутентификация
+
+paths:
+  # ====== Заказы ======
+  /orders:
+    post:
+      summary: Создать заказ
+      description: |
+        Создаёт новый заказ. В процессе выполнения:
+        1. Проверяет наличие продуктов в роботах (UC-06).
+        2. Инициирует оплату через платёжную систему (UC-01).
+        3. При успехе передаёт заказ в очередь адаптера (UC-03).
+      operationId: createOrder
+      tags:
+        - Заказы
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Заказ успешно создан и оплачен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          description: Некорректные данные заказа
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Продукты недоступны или ошибка оплаты
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Сервис временно недоступен (платёжная система или СУР не отвечают)
+
+    get:
+      summary: Получить список заказов
+      description: |
+        Возвращает список заказов с возможностью фильтрации по статусу, дате и пагинацией.
+        Доступно менеджеру по гостеприимству.
+      operationId: getOrders
+      tags:
+        - Заказы
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [CREATED, CHECKING, ACCEPTED, IN_PROGRESS, READY, COMPLETED, CANCELLED, FAILED]
+          description: Фильтр по статусу заказа
+        - name: fromDate
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Начальная дата для фильтрации
+        - name: toDate
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Конечная дата для фильтрации
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+          description: Количество записей на странице
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Смещение для пагинации
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrderResponse'
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+        '403':
+          description: Доступ запрещён (недостаточно прав)
+
+  /orders/{orderId}:
+    get:
+      summary: Получить заказ по ID
+      description: Возвращает детальную информацию о заказе, включая историю статусов.
+      operationId: getOrderById
+      tags:
+        - Заказы
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailResponse'
+        '404':
+          description: Заказ не найден
+
+    delete:
+      summary: Отменить заказ
+      description: |
+        Отменяет заказ (доступно менеджеру по гостеприимству).
+        При отмене:
+        1. Отправляет команду в СУР на отмену (UC-02).
+        2. Инициирует возврат средств через платёжную систему (UC-02).
+        3. Обновляет статус на табло и экране кухни.
+      operationId: cancelOrder
+      tags:
+        - Заказы
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Заказ успешно отменён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          description: Заказ нельзя отменить (уже готов, выдан или уже отменён)
+        '403':
+          description: Доступ запрещён (недостаточно прав)
+        '404':
+          description: Заказ не найден
+        '503':
+          description: Не удалось отменить заказ в СУР (обратитесь к администратору)
+
+  /orders/{orderId}/status:
+    get:
+      summary: Получить статус заказа
+      description: Возвращает текущий статус заказа для отображения на табло и экране кухни.
+      operationId: getOrderStatus
+      tags:
+        - Заказы
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orderId:
+                    type: string
+                    format: uuid
+                  status:
+                    $ref: '#/components/schemas/OrderStatus'
+                  robotOrderId:
+                    type: string
+                  updatedAt:
+                    type: string
+                    format: date-time
+        '404':
+          description: Заказ не найден
+
+  # ====== Меню ======
+  /menu:
+    get:
+      summary: Получить текущее меню
+      description: |
+        Возвращает список доступных позиций меню с учётом:
+        - временных исключений (isTemporarilyUnavailable)
+        - акций (финальная цена с учётом скидки)
+      operationId: getMenu
+      tags:
+        - Меню
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MenuItemResponse'
+
+    post:
+      summary: Добавить позицию в меню
+      description: Добавляет новую позицию в меню (доступно менеджеру по ассортименту).
+      operationId: addMenuItem
+      tags:
+        - Меню
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMenuItemRequest'
+      responses:
+        '201':
+          description: Позиция успешно добавлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MenuItemResponse'
+        '400':
+          description: Некорректные данные (обязательные поля не заполнены, дубликат названия)
+        '403':
+          description: Доступ запрещён (недостаточно прав)
+
+  /menu/{itemId}:
+    put:
+      summary: Обновить позицию меню
+      description: Обновляет информацию о позиции меню (доступно менеджеру по ассортименту).
+      operationId: updateMenuItem
+      tags:
+        - Меню
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMenuItemRequest'
+      responses:
+        '200':
+          description: Позиция успешно обновлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MenuItemResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Позиция не найдена
+
+    delete:
+      summary: Удалить позицию из меню
+      description: |
+        Удаляет позицию из меню (мягкое удаление, доступно менеджеру по ассортименту).
+        Если позиция используется в активных заказах, удаление запрещается.
+      operationId: deleteMenuItem
+      tags:
+        - Меню
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Позиция успешно удалена
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Позиция не найдена
+        '409':
+          description: Позиция используется в текущих заказах, удаление невозможно
+
+  /menu/{itemId}/availability:
+    patch:
+      summary: Временно исключить/вернуть позицию в меню
+      description: |
+        Изменяет флаг временной доступности позиции (доступно менеджеру по гостеприимству).
+        При исключении позиция перестаёт отображаться на терминалах и табло.
+      operationId: toggleMenuItemAvailability
+      tags:
+        - Меню
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                isTemporarilyUnavailable:
+                  type: boolean
+                  description: true — исключить из меню, false — вернуть в меню
+                reason:
+                  type: string
+                  description: Причина исключения (опционально)
+      responses:
+        '200':
+          description: Статус доступности обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MenuItemResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Позиция не найдена
+
+  # ====== Технологические карты ======
+  /recipes:
+    get:
+      summary: Получить список технологических карт
+      description: Возвращает список всех техкарт (доступно технологу).
+      operationId: getRecipes
+      tags:
+        - Технологические карты
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecipeResponse'
+
+    post:
+      summary: Загрузить технологическую карту
+      description: |
+        Загружает новую техкарту в СУР (доступно технологу).
+        JSON-структура проверяется на валидность по схеме СУР.
+      operationId: uploadRecipe
+      tags:
+        - Технологические карты
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadRecipeRequest'
+      responses:
+        '201':
+          description: Техкарта успешно загружена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipeResponse'
+        '400':
+          description: Некорректный JSON техкарты
+        '403':
+          description: Доступ запрещён
+        '409':
+          description: Техкарта с таким именем уже существует
+
+  /recipes/{recipeId}:
+    put:
+      summary: Обновить технологическую карту
+      description: Обновляет существующую техкарту (доступно технологу).
+      operationId: updateRecipe
+      tags:
+        - Технологические карты
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: recipeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRecipeRequest'
+      responses:
+        '200':
+          description: Техкарта успешно обновлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipeResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Техкарта не найдена
+
+    delete:
+      summary: Удалить технологическую карту
+      description: |
+        Удаляет техкарту (доступно технологу).
+        Если техкарта используется в активных заказах, удаление запрещается.
+      operationId: deleteRecipe
+      tags:
+        - Технологические карты
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: recipeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Техкарта успешно удалена
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Техкарта не найдена
+        '409':
+          description: Техкарта используется в активных заказах
+
+  # ====== Продукты ======
+  /products:
+    get:
+      summary: Получить список продуктов (ингредиентов)
+      description: Возвращает справочник продуктов (доступно технологу).
+      operationId: getProducts
+      tags:
+        - Продукты
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductResponse'
+
+    patch:
+      summary: Обновить справочник продуктов
+      description: |
+        Обновляет справочник продуктов в роботах (доступно технологу).
+        Позволяет добавлять, редактировать и удалять продукты.
+      operationId: updateProducts
+      tags:
+        - Продукты
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/UpdateProductRequest'
+      responses:
+        '200':
+          description: Справочник продуктов обновлён
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductResponse'
+        '403':
+          description: Доступ запрещён
+
+  # ====== Остатки в роботах ======
+  /stock/robots:
+    get:
+      summary: Получить остатки в роботах
+      description: |
+        Возвращает текущие остатки продуктов в контейнерах роботов.
+        Доступно технологу и менеджеру по гостеприимству.
+      operationId: getRobotStock
+      tags:
+        - Остатки
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: robotId
+          in: query
+          schema:
+            type: string
+          description: ID робота (если не указан — все роботы)
+        - name: ingredientId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: ID ингредиента (если не указан — все ингредиенты)
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RobotStockResponse'
+        '403':
+          description: Доступ запрещён
+
+  # ====== Дозагрузка ======
+  /refill/tasks:
+    get:
+      summary: Получить задания на дозагрузку
+      description: Возвращает список заданий на дозагрузку с фильтрацией по статусу.
+      operationId: getRefillTasks
+      tags:
+        - Дозагрузка
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [PENDING, IN_PROGRESS, COMPLETED, CANCELLED]
+          description: Фильтр по статусу задания
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RefillTaskResponse'
+
+  /refill/confirm:
+    post:
+      summary: Подтвердить дозагрузку
+      description: |
+        Подтверждает завершение дозагрузки продукта сотрудником кухни.
+        После подтверждения СУР обновляет остатки в роботе, складская система — остатки на складе.
+      operationId: confirmRefill
+      tags:
+        - Дозагрузка
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRefillRequest'
+      responses:
+        '200':
+          description: Дозагрузка подтверждена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefillTaskResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Задание не найдено
+        '409':
+          description: Задание уже выполнено или отменено
+
+  # ====== Аналитика ======
+  /analytics/losses:
+    get:
+      summary: Получить отчёт по техническим потерям
+      description: |
+        Возвращает статистику по браку и перерасходу ингредиентов за период.
+        Доступно технологу.
+      operationId: getLossesReport
+      tags:
+        - Аналитика
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fromDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: toDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [json, csv, pdf]
+            default: json
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LossesReportResponse'
+            application/csv:
+              schema:
+                type: string
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '403':
+          description: Доступ запрещён
+
+  # ====== Аутентификация ======
+  /auth/login:
+    post:
+      summary: Аутентификация пользователя
+      description: Возвращает JWT-токен для доступа к API.
+      operationId: login
+      tags:
+        - Аутентификация
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Успешная аутентификация
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken:
+                    type: string
+                  tokenType:
+                    type: string
+                    example: Bearer
+                  expiresIn:
+                    type: integer
+                  role:
+                    $ref: '#/components/schemas/UserRole'
+        '401':
+          description: Неверный логин или пароль
+
+  /auth/refresh:
+    post:
+      summary: Обновить JWT-токен
+      operationId: refreshToken
+      tags:
+        - Аутентификация
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Токен обновлён
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken:
+                    type: string
+                  tokenType:
+                    type: string
+                    example: Bearer
+                  expiresIn:
+                    type: integer
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    # ====== Enums ======
+    OrderStatus:
+      type: string
+      enum: [CREATED, CHECKING, ACCEPTED, IN_PROGRESS, READY, COMPLETED, CANCELLED, FAILED]
+
+    PaymentStatus:
+      type: string
+      enum: [PENDING, PAID, FAILED, REFUNDED]
+
+    RefillStatus:
+      type: string
+      enum: [PENDING, IN_PROGRESS, COMPLETED, CANCELLED]
+
+    PromotionType:
+      type: string
+      enum: [PERCENT_DISCOUNT, FIXED_DISCOUNT, COMBO, BOGO]
+
+    UserRole:
+      type: string
+      enum: [MANAGER, ASSORTMENT_MANAGER, TECHNOLOGIST, ADMIN]
+
+    LogLevel:
+      type: string
+      enum: [INFO, ERROR, DEBUG]
+
+    # ====== Error ======
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Код ошибки
+        message:
+          type: string
+          description: Описание ошибки
+        details:
+          type: object
+          description: Дополнительная информация (опционально)
+
+    # ====== Заказы ======
+    CreateOrderRequest:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required:
+              - dishId
+              - quantity
+            properties:
+              dishId:
+                type: string
+                format: uuid
+              quantity:
+                type: integer
+                minimum: 1
+              specialInstructions:
+                type: string
+        paymentMethod:
+          type: string
+          enum: [CARD, CASH, QR]
+        customerPhone:
+          type: string
+
+    OrderItemResponse:
+      type: object
+      properties:
+        dishId:
+          type: string
+          format: uuid
+        dishName:
+          type: string
+        quantity:
+          type: integer
+        priceAtOrder:
+          type: number
+          format: decimal
+        subtotal:
+          type: number
+          format: decimal
+        specialInstructions:
+          type: string
+
+    OrderResponse:
+      type: object
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        totalAmount:
+          type: number
+          format: decimal
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        paymentStatus:
+          $ref: '#/components/schemas/PaymentStatus'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemResponse'
+
+    OrderDetailResponse:
+      allOf:
+        - $ref: '#/components/schemas/OrderResponse'
+        - type: object
+          properties:
+            robotOrderId:
+              type: string
+            updatedAt:
+              type: string
+              format: date-time
+            statusHistory:
+              type: array
+              items:
+                type: object
+                properties:
+                  status:
+                    $ref: '#/components/schemas/OrderStatus'
+                  timestamp:
+                    type: string
+                    format: date-time
+
+    # ====== Меню ======
+    MenuItemResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        price:
+          type: number
+          format: decimal
+        category:
+          type: string
+        isAvailable:
+          type: boolean
+        isTemporarilyUnavailable:
+          type: boolean
+        finalPrice:
+          type: number
+          format: decimal
+          description: Цена с учётом активной акции
+
+    CreateMenuItemRequest:
+      type: object
+      required:
+        - name
+        - price
+        - category
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        price:
+          type: number
+          format: decimal
+        category:
+          type: string
+        recipeId:
+          type: string
+          format: uuid
+          description: ID существующей техкарты (или будет создана новая)
+
+    UpdateMenuItemRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        price:
+          type: number
+          format: decimal
+        category:
+          type: string
+        recipeId:
+          type: string
+          format: uuid
+
+    # ====== Технологические карты ======
+    RecipeResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        version:
+          type: string
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    UploadRecipeRequest:
+      type: object
+      required:
+        - name
+        - recipeJson
+      properties:
+        name:
+          type: string
+        recipeJson:
+          type: object
+          description: Технологическая карта в формате JSON (по спецификации СУР)
+
+    UpdateRecipeRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        recipeJson:
+          type: object
+        isActive:
+          type: boolean
+
+    # ====== Продукты ======
+    ProductResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        unit:
+          type: string
+        threshold:
+          type: number
+          format: decimal
+        currentStock:
+          type: number
+          format: decimal
+
+    UpdateProductRequest:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        unit:
+          type: string
+        threshold:
+          type: number
+          format: decimal
+        currentStock:
+          type: number
+          format: decimal
+
+    # ====== Остатки ======
+    RobotStockResponse:
+      type: object
+      properties:
+        robotId:
+          type: string
+        ingredientId:
+          type: string
+          format: uuid
+        ingredientName:
+          type: string
+        currentLevel:
+          type: number
+          format: decimal
+        maxCapacity:
+          type: number
+          format: decimal
+        remainingPercent:
+          type: number
+          format: decimal
+        needsRefill:
+          type: boolean
+        lastUpdated:
+          type: string
+          format: date-time
+
+    # ====== Дозагрузка ======
+    RefillTaskResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        productName:
+          type: string
+        robotId:
+          type: string
+        quantity:
+          type: number
+          format: decimal
+        status:
+          $ref: '#/components/schemas/RefillStatus'
+        createdAt:
+          type: string
+          format: date-time
+        assignedTo:
+          type: string
+        completedAt:
+          type: string
+          format: date-time
+
+    ConfirmRefillRequest:
+      type: object
+      required:
+        - taskId
+        - robotId
+      properties:
+        taskId:
+          type: string
+          format: uuid
+        robotId:
+          type: string
+
+    # ====== Аналитика ======
+    WasteItem:
+      type: object
+      properties:
+        ingredientName:
+          type: string
+        usedQuantity:
+          type: number
+          format: decimal
+        wastedQuantity:
+          type: number
+          format: decimal
+        wastePercent:
+          type: number
+          format: decimal
+
+    LossesReportResponse:
+      type: object
+      properties:
+        period:
+          type: object
+          properties:
+            fromDate:
+              type: string
+              format: date-time
+            toDate:
+              type: string
+              format: date-time
+        totalOrders:
+          type: integer
+        successfulOrders:
+          type: integer
+        cancelledOrders:
+          type: integer
+        failedOrders:
+          type: integer
+        wasteByIngredient:
+          type: array
+          items:
+            $ref: '#/components/schemas/WasteItem'
