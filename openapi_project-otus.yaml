@@ -3,9 +3,16 @@ info:
   title: API системы автоматизации заказов (ресторан быстрого питания с роботами)
   description: |
     API для управления заказами, меню, технологическими картами, продуктами,
-    остатками в роботах, заданиями на дозагрузку, аналитикой и интеграцией
+    остатками в роботах, заданиями на дозагрузку, аналитикой, акциями и интеграцией
     с платёжной системой, табло и экраном кухни.
-  version: 1.0.0
+    
+    ## Ключевые архитектурные решения:
+    - Монолитная архитектура (СУЗ — единый оркестратор)
+    - Прямая синхронная интеграция СУЗ ↔ СУР (без адаптера и очереди)
+    - Двухэтапная оплата: авторизация (холдирование) → списание (capture)
+    - Новые статусы: REJECTED_AVAILABILITY, AUTHORIZED, AUTOMATED
+    - Роль сотрудника кухни: KITCHEN_STAFF
+  version: 2.0.0
   contact:
     name: Support Team
     email: support@restaurant-system.com
@@ -20,21 +27,21 @@ servers:
 
 tags:
   - name: Заказы
-    description: Управление заказами (создание, отмена, получение статуса)
+    description: Управление заказами (создание, отмена, получение статуса, список)
   - name: Меню
     description: Управление меню (CRUD, временное исключение позиций)
+  - name: Акции
+    description: Управление маркетинговыми акциями (CRUD, активация)
   - name: Технологические карты
     description: Управление технологическими картами для роботов
   - name: Продукты
     description: Управление справочником продуктов (ингредиентов)
   - name: Остатки
-    description: Просмотр остатков продуктов в роботах
+    description: Просмотр остатков продуктов в роботах (кэш)
   - name: Дозагрузка
     description: Управление заданиями на дозагрузку продуктов
   - name: Аналитика
     description: Отчёты по техническим потерям и аналитика
-  - name: Логи
-    description: Просмотр логов и сбоев интеграции (через агрегацию)
   - name: Аутентификация
     description: Управление пользователями и аутентификация
 
@@ -46,8 +53,10 @@ paths:
       description: |
         Создаёт новый заказ. В процессе выполнения:
         1. Проверяет наличие продуктов в роботах (UC-06).
-        2. Инициирует оплату через платёжную систему (UC-01).
-        3. При успехе передаёт заказ в очередь адаптера (UC-03).
+        2. Инициирует авторизацию (холдирование) средств через платёжную систему (UC-01).
+        3. При успехе передаёт заказ в СУР (UC-03).
+        4. После подтверждения от СУР (ACCEPTED) выполняет списание (capture).
+        5. При недоступности продуктов создаёт заказ со статусом REJECTED_AVAILABILITY.
       operationId: createOrder
       tags:
         - Заказы
@@ -59,7 +68,7 @@ paths:
               $ref: '#/components/schemas/CreateOrderRequest'
       responses:
         '201':
-          description: Заказ успешно создан и оплачен
+          description: Заказ успешно создан, оплачен и передан в СУР
           content:
             application/json:
               schema:
@@ -94,7 +103,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [CREATED, CHECKING, ACCEPTED, IN_PROGRESS, READY, COMPLETED, CANCELLED, FAILED]
+            enum: [CREATED, CHECKING, REJECTED_AVAILABILITY, AUTHORIZED, ACCEPTED, IN_PROGRESS, READY, COMPLETED, CANCELLED, FAILED, AUTOMATED]
           description: Фильтр по статусу заказа
         - name: fromDate
           in: query
@@ -165,6 +174,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrderDetailResponse'
+        '403':
+          description: Доступ запрещён
         '404':
           description: Заказ не найден
 
@@ -247,6 +258,7 @@ paths:
         Возвращает список доступных позиций меню с учётом:
         - временных исключений (isTemporarilyUnavailable)
         - акций (финальная цена с учётом скидки)
+        Активные акции применяются автоматически при расчёте финальной цены.
       operationId: getMenu
       tags:
         - Меню
@@ -389,6 +401,196 @@ paths:
           description: Доступ запрещён
         '404':
           description: Позиция не найдена
+
+  # ====== Акции ======
+  /promotions:
+    get:
+      summary: Получить список акций
+      description: Возвращает список всех акций (доступно менеджеру по ассортименту).
+      operationId: getPromotions
+      tags:
+        - Акции
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: isActive
+          in: query
+          schema:
+            type: boolean
+          description: Фильтр по активности акции
+        - name: type
+          in: query
+          schema:
+            $ref: '#/components/schemas/PromotionType'
+          description: Фильтр по типу акции
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PromotionResponse'
+        '403':
+          description: Доступ запрещён
+
+    post:
+      summary: Создать акцию
+      description: Создаёт новую маркетинговую акцию (доступно менеджеру по ассортименту).
+      operationId: createPromotion
+      tags:
+        - Акции
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePromotionRequest'
+      responses:
+        '201':
+          description: Акция успешно создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionResponse'
+        '400':
+          description: Некорректные данные
+        '403':
+          description: Доступ запрещён
+
+  /promotions/{promotionId}:
+    get:
+      summary: Получить акцию по ID
+      description: Возвращает детальную информацию об акции.
+      operationId: getPromotionById
+      tags:
+        - Акции
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: promotionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Акция не найдена
+
+    put:
+      summary: Обновить акцию
+      description: Обновляет информацию об акции (доступно менеджеру по ассортименту).
+      operationId: updatePromotion
+      tags:
+        - Акции
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: promotionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePromotionRequest'
+      responses:
+        '200':
+          description: Акция успешно обновлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Акция не найдена
+
+    delete:
+      summary: Удалить акцию
+      description: |
+        Удаляет акцию (мягкое удаление, доступно менеджеру по ассортименту).
+        Если акция применяется к активным позициям меню, удаление запрещается.
+      operationId: deletePromotion
+      tags:
+        - Акции
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: promotionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Акция успешно удалена
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Акция не найдена
+        '409':
+          description: Акция используется в текущих позициях меню, удаление невозможно
+
+  /promotions/{promotionId}/activate:
+    patch:
+      summary: Активировать/деактивировать акцию
+      description: |
+        Изменяет статус активности акции (доступно менеджеру по ассортименту).
+        При активации акция применяется к соответствующим позициям меню.
+        При деактивации цены возвращаются к базовым.
+      operationId: togglePromotionStatus
+      tags:
+        - Акции
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: promotionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - isActive
+              properties:
+                isActive:
+                  type: boolean
+                  description: true — активировать, false — деактивировать
+      responses:
+        '200':
+          description: Статус акции обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionResponse'
+        '403':
+          description: Доступ запрещён
+        '404':
+          description: Акция не найдена
 
   # ====== Технологические карты ======
   /recipes:
@@ -554,10 +756,10 @@ paths:
   # ====== Остатки в роботах ======
   /stock/robots:
     get:
-      summary: Получить остатки в роботах
+      summary: Получить остатки в роботах (кэш)
       description: |
-        Возвращает текущие остатки продуктов в контейнерах роботов.
-        Доступно технологу и менеджеру по гостеприимству.
+        Возвращает текущие остатки продуктов в контейнерах роботов (кэш СУЗ).
+        Источник истины — СУР. Доступно технологу и менеджеру по гостеприимству.
       operationId: getRobotStock
       tags:
         - Остатки
@@ -619,7 +821,10 @@ paths:
       summary: Подтвердить дозагрузку
       description: |
         Подтверждает завершение дозагрузки продукта сотрудником кухни.
-        После подтверждения СУР обновляет остатки в роботе, складская система — остатки на складе.
+        После подтверждения:
+        1. СУЗ обновляет статус задания на COMPLETED.
+        2. СУЗ уведомляет складскую систему об обновлении остатков.
+        3. СУЗ обновляет кэш RobotStock в следующем цикле мониторинга.
       operationId: confirmRefill
       tags:
         - Дозагрузка
@@ -639,7 +844,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/RefillTaskResponse'
         '403':
-          description: Доступ запрещён
+          description: Доступ запрещён (требуется роль KITCHEN_STAFF или ADMIN)
         '404':
           description: Задание не найдено
         '409':
@@ -651,7 +856,7 @@ paths:
       summary: Получить отчёт по техническим потерям
       description: |
         Возвращает статистику по браку и перерасходу ингредиентов за период.
-        Доступно технологу.
+        Доступно технологу. Включает дашборды и инструменты анализа.
       operationId: getLossesReport
       tags:
         - Аналитика
@@ -670,6 +875,13 @@ paths:
           schema:
             type: string
             format: date-time
+        - name: groupBy
+          in: query
+          schema:
+            type: string
+            enum: [dish, time, robot]
+            default: dish
+          description: Группировка данных для анализа причин потерь
         - name: format
           in: query
           schema:
@@ -770,11 +982,11 @@ components:
     # ====== Enums ======
     OrderStatus:
       type: string
-      enum: [CREATED, CHECKING, ACCEPTED, IN_PROGRESS, READY, COMPLETED, CANCELLED, FAILED]
+      enum: [CREATED, CHECKING, REJECTED_AVAILABILITY, AUTHORIZED, ACCEPTED, IN_PROGRESS, READY, COMPLETED, CANCELLED, FAILED, AUTOMATED]
 
     PaymentStatus:
       type: string
-      enum: [PENDING, PAID, FAILED, REFUNDED]
+      enum: [PENDING, AUTHORIZED, PAID, FAILED, REFUNDED]
 
     RefillStatus:
       type: string
@@ -786,7 +998,7 @@ components:
 
     UserRole:
       type: string
-      enum: [MANAGER, ASSORTMENT_MANAGER, TECHNOLOGIST, ADMIN]
+      enum: [KITCHEN_STAFF, MANAGER, ASSORTMENT_MANAGER, TECHNOLOGIST, ADMIN]
 
     LogLevel:
       type: string
@@ -869,6 +1081,9 @@ components:
           $ref: '#/components/schemas/OrderStatus'
         paymentStatus:
           $ref: '#/components/schemas/PaymentStatus'
+        isManual:
+          type: boolean
+          description: true — было ручное вмешательство, false — автоматический заказ
         items:
           type: array
           items:
@@ -909,6 +1124,7 @@ components:
         price:
           type: number
           format: decimal
+          description: Базовая цена
         category:
           type: string
         isAvailable:
@@ -918,7 +1134,10 @@ components:
         finalPrice:
           type: number
           format: decimal
-          description: Цена с учётом активной акции
+          description: Цена с учётом активной акции (если применимо)
+        promotion:
+          $ref: '#/components/schemas/PromotionResponse'
+          description: Информация об активной акции (если применимо)
 
     CreateMenuItemRequest:
       type: object
@@ -940,6 +1159,10 @@ components:
           type: string
           format: uuid
           description: ID существующей техкарты (или будет создана новая)
+        promotionId:
+          type: string
+          format: uuid
+          description: ID акции, если позиция участвует в акции
 
     UpdateMenuItemRequest:
       type: object
@@ -956,6 +1179,99 @@ components:
         recipeId:
           type: string
           format: uuid
+        promotionId:
+          type: string
+          format: uuid
+
+    # ====== Акции ======
+    CreatePromotionRequest:
+      type: object
+      required:
+        - name
+        - type
+        - startDate
+        - endDate
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        type:
+          $ref: '#/components/schemas/PromotionType'
+        discountPercentage:
+          type: number
+          format: decimal
+          description: Размер скидки в процентах (для PERCENT_DISCOUNT)
+        discountFixed:
+          type: number
+          format: decimal
+          description: Фиксированная скидка в рублях (для FIXED_DISCOUNT)
+        conditions:
+          type: string
+          description: Условия акции (например, "при заказе от 1000 руб.")
+        startDate:
+          type: string
+          format: date-time
+        endDate:
+          type: string
+          format: date-time
+
+    UpdatePromotionRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        type:
+          $ref: '#/components/schemas/PromotionType'
+        discountPercentage:
+          type: number
+          format: decimal
+        discountFixed:
+          type: number
+          format: decimal
+        conditions:
+          type: string
+        startDate:
+          type: string
+          format: date-time
+        endDate:
+          type: string
+          format: date-time
+
+    PromotionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        type:
+          $ref: '#/components/schemas/PromotionType'
+        discountPercentage:
+          type: number
+          format: decimal
+          description: Размер скидки в процентах (для PERCENT_DISCOUNT)
+        discountFixed:
+          type: number
+          format: decimal
+          description: Фиксированная скидка в рублях (для FIXED_DISCOUNT)
+        conditions:
+          type: string
+          description: Условия акции (например, "при заказе от 1000 руб.")
+        startDate:
+          type: string
+          format: date-time
+        endDate:
+          type: string
+          format: date-time
+        isActive:
+          type: boolean
+          description: Активна ли акция в данный момент
 
     # ====== Технологические карты ======
     RecipeResponse:
@@ -968,36 +1284,100 @@ components:
           type: string
         version:
           type: string
-        isActive:
-          type: boolean
+        description:
+          type: string
+        ingredients:
+          type: array
+          items:
+            type: object
+            properties:
+              productId:
+                type: string
+                format: uuid
+              productName:
+                type: string
+              quantity:
+                type: number
+                format: decimal
+              unit:
+                type: string
+        steps:
+          type: array
+          items:
+            type: string
+        cookingTime:
+          type: integer
+          description: Время приготовления в секундах
         createdAt:
           type: string
           format: date-time
         updatedAt:
           type: string
           format: date-time
+        isActive:
+          type: boolean
 
     UploadRecipeRequest:
       type: object
       required:
         - name
-        - recipeJson
+        - ingredients
+        - steps
       properties:
         name:
           type: string
-        recipeJson:
-          type: object
-          description: Технологическая карта в формате JSON (по спецификации СУР)
+        description:
+          type: string
+        ingredients:
+          type: array
+          items:
+            type: object
+            required:
+              - productId
+              - quantity
+            properties:
+              productId:
+                type: string
+                format: uuid
+              quantity:
+                type: number
+                format: decimal
+              unit:
+                type: string
+        steps:
+          type: array
+          items:
+            type: string
+        cookingTime:
+          type: integer
+          description: Время приготовления в секундах
 
     UpdateRecipeRequest:
       type: object
       properties:
         name:
           type: string
-        recipeJson:
-          type: object
-        isActive:
-          type: boolean
+        description:
+          type: string
+        ingredients:
+          type: array
+          items:
+            type: object
+            properties:
+              productId:
+                type: string
+                format: uuid
+              quantity:
+                type: number
+                format: decimal
+              unit:
+                type: string
+        steps:
+          type: array
+          items:
+            type: string
+        cookingTime:
+          type: integer
 
     # ====== Продукты ======
     ProductResponse:
@@ -1008,14 +1388,23 @@ components:
           format: uuid
         name:
           type: string
+        description:
+          type: string
+        category:
+          type: string
         unit:
           type: string
-        threshold:
+        pricePerUnit:
           type: number
           format: decimal
-        currentStock:
-          type: number
-          format: decimal
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
 
     UpdateProductRequest:
       type: object
@@ -1027,14 +1416,17 @@ components:
           format: uuid
         name:
           type: string
+        description:
+          type: string
+        category:
+          type: string
         unit:
           type: string
-        threshold:
+        pricePerUnit:
           type: number
           format: decimal
-        currentStock:
-          type: number
-          format: decimal
+        isActive:
+          type: boolean
 
     # ====== Остатки ======
     RobotStockResponse:
@@ -1042,22 +1434,18 @@ components:
       properties:
         robotId:
           type: string
-        ingredientId:
+        productId:
           type: string
           format: uuid
-        ingredientName:
+        productName:
           type: string
-        currentLevel:
+        quantity:
           type: number
           format: decimal
-        maxCapacity:
-          type: number
-          format: decimal
-        remainingPercent:
-          type: number
-          format: decimal
-        needsRefill:
-          type: boolean
+        unit:
+          type: string
+        containerId:
+          type: string
         lastUpdated:
           type: string
           format: date-time
@@ -1069,9 +1457,12 @@ components:
         id:
           type: string
           format: uuid
-        productName:
-          type: string
         robotId:
+          type: string
+        productId:
+          type: string
+          format: uuid
+        productName:
           type: string
         quantity:
           type: number
@@ -1081,61 +1472,75 @@ components:
         createdAt:
           type: string
           format: date-time
-        assignedTo:
+        updatedAt:
           type: string
+          format: date-time
         completedAt:
           type: string
           format: date-time
+        createdBy:
+          type: string
+        completedBy:
+          type: string
+        notes:
+          type: string
 
     ConfirmRefillRequest:
       type: object
       required:
         - taskId
-        - robotId
       properties:
         taskId:
           type: string
           format: uuid
-        robotId:
+        notes:
           type: string
 
     # ====== Аналитика ======
-    WasteItem:
-      type: object
-      properties:
-        ingredientName:
-          type: string
-        usedQuantity:
-          type: number
-          format: decimal
-        wastedQuantity:
-          type: number
-          format: decimal
-        wastePercent:
-          type: number
-          format: decimal
-
     LossesReportResponse:
       type: object
       properties:
         period:
           type: object
           properties:
-            fromDate:
+            from:
               type: string
               format: date-time
-            toDate:
+            to:
               type: string
               format: date-time
-        totalOrders:
-          type: integer
-        successfulOrders:
-          type: integer
-        cancelledOrders:
-          type: integer
-        failedOrders:
-          type: integer
-        wasteByIngredient:
+        totalLosses:
+          type: number
+          format: decimal
+          description: Общая сумма потерь в рублях
+        lossesByDish:
           type: array
           items:
-            $ref: '#/components/schemas/WasteItem'
+            type: object
+            properties:
+              dishName:
+                type: string
+              lossAmount:
+                type: number
+                format: decimal
+              lossPercentage:
+                type: number
+                format: decimal
+        lossesByIngredient:
+          type: array
+          items:
+            type: object
+            properties:
+              ingredientName:
+                type: string
+              wastedQuantity:
+                type: number
+                format: decimal
+              unit:
+                type: string
+              cost:
+                type: number
+                format: decimal
+        generatedAt:
+          type: string
+          format: date-time
